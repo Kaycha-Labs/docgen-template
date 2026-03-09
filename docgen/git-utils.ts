@@ -106,9 +106,20 @@ export function commitAndPush(cwd: string, files: string[], triggerCommitMessage
     stdio: ['pipe', 'pipe', 'pipe'],
   }).trim();
 
-  execSync(`git push origin HEAD:${branch}`, { cwd, stdio: 'pipe' });
+  // Pull rebase first to avoid "fetch first" rejections
+  try {
+    execSync(`git pull --rebase origin ${branch}`, { cwd, stdio: 'pipe' });
+  } catch {
+    // If pull fails (no upstream, etc.), just try pushing anyway
+  }
 
-  console.log(`Pushed docgen commit to ${branch}`);
+  try {
+    execSync(`git push origin HEAD:${branch}`, { cwd, stdio: 'pipe' });
+    console.log(`Pushed docgen commit to ${branch}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`  ⚠ Push failed (docs committed locally): ${msg.split('\n')[0]}`);
+  }
 }
 
 function truncate(s: string, maxLen: number): string {
