@@ -1,14 +1,18 @@
 /**
  * Kaycha DocGen — DEPS.yaml + CLAUDE.md Generator
  * Parses lockfiles and package manifests to produce machine-readable dependency maps.
+ * Now with real dependency tree traversal from lockfiles (npm v3, pnpm v9).
  * No LLM required — deterministic parsing.
  */
 
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { DepsYaml, DependencyEntry, IntegrationEntry } from './types.js';
+import { parseNpmLockfile, parsePnpmLockfile, LockfileData } from './lockfile-parsers.js';
 
 const GENERATOR_VERSION = 'kaycha-docgen@1.0.0';
+
+// ─── Public API ───────────────────────────────────────────────────
 
 /**
  * Detect and parse dependencies, write DEPS.yaml and update CLAUDE.md.
@@ -30,6 +34,8 @@ export function updateDeps(repoRoot: string, repoName: string): string[] {
 
   return written;
 }
+
+// ─── Core Builder ─────────────────────────────────────────────────
 
 function buildDepsYaml(repoRoot: string, repoName: string): DepsYaml {
   const deps: DepsYaml = {
@@ -55,45 +61,62 @@ function buildDepsYaml(repoRoot: string, repoName: string): DepsYaml {
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
 
     // Detect package manager
+    let pmType: 'pnpm' | 'yarn' | 'bun' | 'npm' = 'npm';
     if (existsSync(join(repoRoot, 'pnpm-lock.yaml'))) {
-      deps.runtime.package_manager = 'pnpm';
+      pmType = 'pnpm';
     } else if (existsSync(join(repoRoot, 'yarn.lock'))) {
-      deps.runtime.package_manager = 'yarn';
+      pmType = 'yarn';
     } else if (existsSync(join(repoRoot, 'bun.lockb'))) {
-      deps.runtime.package_manager = 'bun';
-    } else {
-      deps.runtime.package_manager = 'npm';
+      pmType = 'bun';
     }
+    deps.runtime.package_manager = pmType;
 
     // Detect Node version
-    if (pkg.engines?.node) {
-      deps.runtime.node = pkg.engines.node;
+    deps.runtime.node = pkg.engines?.node || '20.x';
+
+    // Attempt lockfile parse
+    let lockData: LockfileData | null = null;
+    if (pmType === 'npm') {
+      lockData = parseNpmLockfile(repoRoot);
+    } else if (pmType === 'pnpm') {
+      lockData = parsePnpmLockfile(repoRoot);
+    }
+    // yarn and bun: no parser yet, fall through to package.json-only
+
+    if (lockData) {
+      // ─── Lockfile path: resolved versions + transitive trees ───
+      deps.dependencies.production = buildResolvedDeps(
+        pkg.dependencies || {},
+        lockData,
+        false,
+      );
+      deps.dependencies.development = buildResolvedDeps(
+        pkg.devDependencies || {},
+        lockData,
+        true,
+      );
     } else {
-      deps.runtime.node = '20.x';
-    }
-
-    // Parse production dependencies
-    if (pkg.dependencies) {
-      deps.dependencies.production = Object.entries(pkg.dependencies).map(
-        ([name, version]) => ({
-          name,
-          version: version as string,
-          purpose: inferPurpose(name),
-          critical: isCritical(name),
-        }),
-      );
-    }
-
-    // Parse dev dependencies
-    if (pkg.devDependencies) {
-      deps.dependencies.development = Object.entries(pkg.devDependencies).map(
-        ([name, version]) => ({
-          name,
-          version: version as string,
-          purpose: inferPurpose(name),
-          critical: false,
-        }),
-      );
+      // ─── Fallback: package.json only (identical to old behavior) ───
+      if (pkg.dependencies) {
+        deps.dependencies.production = Object.entries(pkg.dependencies).map(
+          ([name, version]) => ({
+            name,
+            version: version as string,
+            purpose: inferPurpose(name),
+            critical: isCritical(name),
+          }),
+        );
+      }
+      if (pkg.devDependencies) {
+        deps.dependencies.development = Object.entries(pkg.devDependencies).map(
+          ([name, version]) => ({
+            name,
+            version: version as string,
+            purpose: inferPurpose(name),
+            critical: false,
+          }),
+        );
+      }
     }
   }
 
@@ -127,13 +150,134 @@ function buildDepsYaml(repoRoot: string, repoName: string): DepsYaml {
   return deps;
 }
 
+// ─── Lockfile-Resolved Dependency Builder ─────────────────────────
+
+/**
+ * Build DependencyEntry[] using resolved data from lockfile.
+ * For each dep in package.json, look up resolved version + transitive tree.
+ */
+function buildResolvedDeps(
+  pkgDeps: Record<string, string>,
+  lockData: LockfileData,
+  isDev: boolean,
+): DependencyEntry[] {
+  return Object.entries(pkgDeps).map(([name, spec]) => {
+    const resolved = lockData.packages.get(name);
+    const critical = isDev ? false : isCritical(name);
+
+    const entry: DependencyEntry = {
+      name,
+      version: resolved?.version || spec,
+      spec: spec,
+      purpose: inferPurpose(name),
+      critical,
+    };
+
+    // Compute transitive dependency tree from lockfile graph
+    if (resolved) {
+      const tree = countTransitives(name, lockData);
+      if (tree.count > 0) {
+        entry.transitive_count = tree.count;
+      }
+      if (critical && tree.topDeps.length > 0) {
+        entry.pulls_in = tree.topDeps;
+      }
+    }
+
+    return entry;
+  });
+}
+
+// ─── BFS Tree Traversal ──────────────────────────────────────────
+
+interface TreeResult {
+  count: number;      // total transitive deps
+  topDeps: string[];  // direct children as "name@version", sorted by weight, max 10
+}
+
+/**
+ * BFS from a root package through directDeps to count all transitive dependencies.
+ * Returns total count + top direct children sorted by their own sub-tree size.
+ */
+function countTransitives(rootName: string, lockData: LockfileData): TreeResult {
+  const rootPkg = lockData.packages.get(rootName);
+  if (!rootPkg || rootPkg.directDeps.length === 0) {
+    return { count: 0, topDeps: [] };
+  }
+
+  const visited = new Set<string>();
+  visited.add(rootName);  // don't count the root itself
+
+  // BFS queue: [depName]
+  const queue: string[] = [...rootPkg.directDeps];
+
+  // Track direct children separately for pulls_in with their sub-tree weights
+  const directChildren: { name: string; version: string; weight: number }[] = [];
+
+  // First, BFS the full tree to get count
+  while (queue.length > 0) {
+    const depName = queue.shift()!;
+    if (visited.has(depName)) continue;
+    visited.add(depName);
+
+    const depPkg = lockData.packages.get(depName);
+    if (depPkg) {
+      for (const child of depPkg.directDeps) {
+        if (!visited.has(child)) {
+          queue.push(child);
+        }
+      }
+    }
+  }
+
+  // Total transitive count = everything visited minus the root
+  const count = visited.size - 1;
+
+  // Now compute weight for each direct child (sub-tree size)
+  for (const childName of rootPkg.directDeps) {
+    const childPkg = lockData.packages.get(childName);
+    if (!childPkg) continue;
+
+    // Quick BFS for this child's subtree
+    const childVisited = new Set<string>();
+    childVisited.add(childName);
+    const childQueue = [...childPkg.directDeps];
+    while (childQueue.length > 0) {
+      const n = childQueue.shift()!;
+      if (childVisited.has(n)) continue;
+      childVisited.add(n);
+      const nPkg = lockData.packages.get(n);
+      if (nPkg) {
+        for (const c of nPkg.directDeps) {
+          if (!childVisited.has(c)) childQueue.push(c);
+        }
+      }
+    }
+
+    directChildren.push({
+      name: childName,
+      version: childPkg.version,
+      weight: childVisited.size,
+    });
+  }
+
+  // Sort by weight descending (heaviest sub-trees first), cap at 10
+  directChildren.sort((a, b) => b.weight - a.weight);
+  const topDeps = directChildren
+    .slice(0, 10)
+    .map((d) => `${d.name}@${d.version}`);
+
+  return { count, topDeps };
+}
+
+// ─── Integrations Detection ──────────────────────────────────────
+
 function detectIntegrations(repoRoot: string): IntegrationEntry[] {
   const integrations: IntegrationEntry[] = [];
 
   // Supabase
   if (existsSync(join(repoRoot, 'supabase/config.toml')) || existsSync(join(repoRoot, 'supabase'))) {
     const entry: IntegrationEntry = { name: 'Supabase', type: 'database' };
-    // Try to extract project ref from config
     const configPath = join(repoRoot, 'supabase/config.toml');
     if (existsSync(configPath)) {
       const config = readFileSync(configPath, 'utf-8');
@@ -166,6 +310,8 @@ function detectIntegrations(repoRoot: string): IntegrationEntry[] {
   return integrations;
 }
 
+// ─── Purpose / Critical Heuristics ───────────────────────────────
+
 /** Infer purpose from package name heuristics */
 function inferPurpose(name: string): string {
   const purposes: [RegExp, string][] = [
@@ -196,6 +342,7 @@ function inferPurpose(name: string): string {
     [/puppeteer|playwright/, 'Browser automation'],
     [/prisma/, 'Database ORM'],
     [/drizzle/, 'Database ORM'],
+    [/embla-carousel/, 'UI framework'],
   ];
 
   for (const [pattern, purpose] of purposes) {
@@ -217,9 +364,12 @@ function isCritical(name: string): boolean {
     /drizzle/,
     /stripe/,
     /anthropic/,
+    /embla-carousel/,
   ];
   return criticalPatterns.some((p) => p.test(name));
 }
+
+// ─── YAML Serializer ─────────────────────────────────────────────
 
 function serializeDepsYaml(deps: DepsYaml): string {
   const lines: string[] = [
@@ -249,8 +399,18 @@ function serializeDepsYaml(deps: DepsYaml): string {
     for (const dep of deps.dependencies.production) {
       lines.push(`    - name: "${dep.name}"`);
       lines.push(`      version: "${dep.version}"`);
+      if (dep.spec) lines.push(`      spec: "${dep.spec}"`);
       lines.push(`      purpose: "${dep.purpose}"`);
       lines.push(`      critical: ${dep.critical}`);
+      if (dep.transitive_count !== undefined) {
+        lines.push(`      transitive_count: ${dep.transitive_count}`);
+      }
+      if (dep.pulls_in && dep.pulls_in.length > 0) {
+        lines.push(`      pulls_in:`);
+        for (const child of dep.pulls_in) {
+          lines.push(`        - "${child}"`);
+        }
+      }
     }
   }
 
@@ -262,8 +422,12 @@ function serializeDepsYaml(deps: DepsYaml): string {
     for (const dep of deps.dependencies.development) {
       lines.push(`    - name: "${dep.name}"`);
       lines.push(`      version: "${dep.version}"`);
+      if (dep.spec) lines.push(`      spec: "${dep.spec}"`);
       lines.push(`      purpose: "${dep.purpose}"`);
       lines.push(`      critical: ${dep.critical}`);
+      if (dep.transitive_count !== undefined) {
+        lines.push(`      transitive_count: ${dep.transitive_count}`);
+      }
     }
   }
 
@@ -293,6 +457,8 @@ function serializeDepsYaml(deps: DepsYaml): string {
   lines.push('');
   return lines.join('\n');
 }
+
+// ─── CLAUDE.md Updater ───────────────────────────────────────────
 
 function updateClaudeMd(claudePath: string, deps: DepsYaml, repoName: string): void {
   let existing = '';
@@ -343,7 +509,13 @@ function buildClaudeMdDepsSection(deps: DepsYaml): string {
   if (critical.length > 0) {
     lines.push('### Critical Dependencies');
     for (const dep of critical) {
-      lines.push(`- \`${dep.name}\` (${dep.version}) — ${dep.purpose}`);
+      const transitiveInfo = dep.transitive_count ? ` [${dep.transitive_count} transitive deps]` : '';
+      lines.push(`- \`${dep.name}\` (${dep.version}) — ${dep.purpose}${transitiveInfo}`);
+      if (dep.pulls_in && dep.pulls_in.length > 0) {
+        for (const child of dep.pulls_in) {
+          lines.push(`  - ${child}`);
+        }
+      }
     }
     lines.push('');
   }

@@ -101,9 +101,12 @@ export interface DepsYaml {
 
 export interface DependencyEntry {
   name: string;
-  version: string;
+  version: string;           // Resolved version from lockfile (e.g., "2.57.4"), or spec if no lockfile
+  spec?: string;             // Original specifier from package.json (e.g., "^2.57.4") — only set when lockfile parsed
   purpose: string;
   critical: boolean;
+  transitive_count?: number; // Total transitive deps (only when lockfile parsed)
+  pulls_in?: string[];       // Direct children as "name@version" (only for critical deps, max 10)
 }
 
 export interface IntegrationEntry {
